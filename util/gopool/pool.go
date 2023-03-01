@@ -16,8 +16,12 @@ package gopool
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
+
+	"github.com/bytedance/gopkg/util/logger"
 )
 
 type Pool interface {
@@ -105,7 +109,7 @@ func (p *pool) Name() string {
 }
 
 func (p *pool) SetCap(cap int32) {
-	atomic.StoreInt32(&p.cap, cap)
+	p.cap = cap
 }
 
 func (p *pool) Go(f func()) {
@@ -113,6 +117,19 @@ func (p *pool) Go(f func()) {
 }
 
 func (p *pool) CtxGo(ctx context.Context, f func()) {
+	// Try to increase the current num of goroutines, if it is less than the cap,
+	// just create a new goroutine directly, no need to enqueue.
+	if p.incWorkerCount() < p.cap {
+		p.run(ctx, f)
+		return
+	}
+	// Else decrease the num andput the task into the list waiting to be executed.
+	// Less lines: for inline opt.
+	p.enqueue(ctx, f)
+}
+
+func (p *pool) enqueue(ctx context.Context, f func()) {
+	p.decWorkerCount()
 	t := taskPool.Get().(*task)
 	t.ctx = ctx
 	t.f = f
@@ -125,17 +142,44 @@ func (p *pool) CtxGo(ctx context.Context, f func()) {
 		p.taskTail = t
 	}
 	p.taskLock.Unlock()
-	atomic.AddInt32(&p.taskCount, 1)
-	// The following two conditions are met:
-	// 1. the number of tasks is greater than the threshold.
-	// 2. The current number of workers is less than the upper limit p.cap.
-	// or there are currently no workers.
-	if (atomic.LoadInt32(&p.taskCount) >= p.config.ScaleThreshold && p.WorkerCount() < atomic.LoadInt32(&p.cap)) || p.WorkerCount() == 0 {
-		p.incWorkerCount()
-		w := workerPool.Get().(*worker)
-		w.pool = p
-		w.run()
+}
+
+func (p *pool) run(ctx context.Context, f func()) {
+	do := func(ctx context.Context, f func()) {
+		defer func() {
+			if r := recover(); r != nil {
+				if p.panicHandler != nil {
+					p.panicHandler(ctx, r)
+				} else {
+					msg := fmt.Sprintf("GOPOOL: panic in pool: %s: %v: %s", p.name, r, debug.Stack())
+					logger.CtxErrorf(ctx, msg)
+				}
+			}
+		}()
+		f()
 	}
+
+	go func(ctx context.Context, f func()) {
+		defer p.decWorkerCount()
+
+		do(ctx, f)
+		for {
+			var t *task
+			p.taskLock.Lock()
+			if p.taskHead != nil {
+				t = p.taskHead
+				p.taskHead = p.taskHead.next
+			}
+			if t == nil {
+				// if there's no task to do, exit
+				p.taskLock.Unlock()
+				return
+			}
+			p.taskLock.Unlock()
+			do(t.ctx, t.f)
+			t.Recycle()
+		}
+	}(ctx, f)
 }
 
 // SetPanicHandler the func here will be called after the panic has been recovered.
@@ -147,8 +191,8 @@ func (p *pool) WorkerCount() int32 {
 	return atomic.LoadInt32(&p.workerCount)
 }
 
-func (p *pool) incWorkerCount() {
-	atomic.AddInt32(&p.workerCount, 1)
+func (p *pool) incWorkerCount() int32 {
+	return atomic.AddInt32(&p.workerCount, 1)
 }
 
 func (p *pool) decWorkerCount() {
